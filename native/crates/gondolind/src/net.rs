@@ -228,7 +228,7 @@ impl Net {
         controller: Arc<R>,
         activity: Option<ActivityHandle>,
     ) -> Result<Self, NetError> {
-        Self::with_options(config, controller, activity, None, None, None)
+        Self::with_options(config, controller, activity, None, None, None, None)
     }
 
     fn with_options<R: ControllerRequests>(
@@ -238,6 +238,7 @@ impl Net {
         resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
         budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
         guard: Option<Arc<gondolin_egress::HttpEgressGuard>>,
+        local_hooks: Option<Arc<dyn gondolin_egress::HookBackend>>,
     ) -> Result<Self, NetError> {
         let ssh = match &config.egress.ssh {
             Some(ssh) => {
@@ -254,7 +255,19 @@ impl Net {
         };
         let hooks =
             Arc::new(RemoteHooks::new(Arc::new(Link(controller)), config.egress.hooks.clone()));
-        let backend = hook_tiers(&config.egress, hooks.clone())?;
+        let backend = match local_hooks {
+            Some(local) => {
+                if config.egress.djs_hooks.is_some()
+                    || config.egress.hooks != proto::HookRegistrations::default()
+                {
+                    return Err(NetError::Hooks(
+                        "in-process and wire hook registrations cannot be combined".into(),
+                    ));
+                }
+                local
+            }
+            None => hook_tiers(&config.egress, hooks.clone())?,
+        };
         let egress =
             Egress::with_options(config.egress, backend, resolver, guard)?.with_ssh_proxy(ssh);
         let handler =
@@ -480,6 +493,7 @@ pub fn build_native(config: &Value, ctx: &SubsystemContext) -> Result<NetSetup, 
             ctx.upstream_resolver.clone(),
             ctx.frame_budget.clone(),
             ctx.http_egress_guard.clone(),
+            ctx.http_hooks.clone(),
         )
         .map_err(|e| e.to_string())?,
     );
@@ -554,6 +568,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedder_hooks_cannot_silently_replace_registered_controller_hooks() {
+        let cfg = decode_config(gondolin_wire::value!({"hooks":{"on_request":{"body":true}}}));
+        assert!(matches!(
+            Net::with_options(
+                cfg,
+                Arc::new(Fake::default()),
+                None,
+                None,
+                None,
+                None,
+                Some(Arc::new(gondolin_egress::NoHooks))
+            ),
+            Err(NetError::Hooks(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn builds_and_routes_messages() {
         let cfg = decode_config(gondolin_wire::value!({
             "hooks": { "is_request_allowed": true },
@@ -621,6 +652,7 @@ mod tests {
             Arc::new(Fake::default()),
             None,
             Some(resolver.clone()),
+            None,
             None,
             None,
         )

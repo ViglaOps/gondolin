@@ -124,6 +124,9 @@ pub struct SubsystemContext {
     pub debug: Vec<String>,
     pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
     pub frame_budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
+    /// In-process HTTP hooks, mutually exclusive with JavaScript and remote callbacks.
+    /// Request/response data stays inside the trusted host process.
+    pub http_hooks: Option<Arc<dyn gondolin_egress::HookBackend>>,
     /// Optional terminal failure latch for HTTP(S)-only egress.
     pub http_egress_guard: Option<Arc<gondolin_egress::HttpEgressGuard>>,
 }

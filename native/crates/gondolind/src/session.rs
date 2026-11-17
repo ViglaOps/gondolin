@@ -646,6 +646,7 @@ impl Session {
             debug: cfg.debug.clone(),
             upstream_resolver: self.embedded.upstream_resolver.clone(),
             frame_budget: self.embedded.frame_budget.clone(),
+            http_hooks: self.embedded.http_hooks.clone(),
             http_egress_guard: self.embedded.http_egress_guard.clone(),
         };
         let vfs = subsystem::build_vfs(cfg.vfs.as_ref(), &ctx)?;
