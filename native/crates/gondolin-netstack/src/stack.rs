@@ -39,6 +39,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::budget::{Direction, FRAME_HEARTBEAT, FrameBudget};
 use crate::config::{DnsMode, MacAddr, NetConfig, SyntheticHostMapping};
 use crate::dns::{self, SyntheticAnswer, SyntheticHostMap};
 use crate::flow;
@@ -109,6 +110,18 @@ impl NetStack {
         handler: Arc<dyn FlowHandler>,
         system_resolvers: Vec<Ipv4Addr>,
     ) -> Result<Self, NetStackError> {
+        Self::with_options(config, handler, Some(system_resolvers), None)
+    }
+
+    /// Builds a stack with host-supplied guest DNS defaults and an optional
+    /// single-attachment, invocation-wide frame budget.
+    pub fn with_options(
+        config: NetConfig,
+        handler: Arc<dyn FlowHandler>,
+        system_resolvers: Option<Vec<Ipv4Addr>>,
+        budget: Option<Arc<FrameBudget>>,
+    ) -> Result<Self, NetStackError> {
+        let system_resolvers = system_resolvers.unwrap_or_else(dns::system_ipv4_resolvers);
         if config.prefix_len == 0 || config.prefix_len > 30 {
             return Err(NetStackError::InvalidConfig("prefix_len must be 1..=30".into()));
         }
@@ -152,6 +165,7 @@ impl NetStack {
             tx_notify: Notify::new(),
             tx_drained: Notify::new(),
             handler,
+            budget,
             hosts: Arc::new(SyntheticHostMap::new()),
             dhcp_dns,
             trusted,
@@ -221,6 +235,9 @@ impl NetStack {
                     "netstack is already serving a netdev stream",
                 ));
             }
+            if let Some(budget) = &shared.budget {
+                budget.attach()?;
+            }
             let session = st.session + 1;
             let next_flow_id = st.next_flow_id;
             *st = State::new(&shared.config, session, shared.epoch);
@@ -233,6 +250,9 @@ impl NetStack {
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
                 self.0.lock().shutdown();
+                if let Some(budget) = &self.0.budget {
+                    budget.disconnect();
+                }
             }
         }
         let _guard = Guard(shared);
@@ -313,6 +333,7 @@ impl Entry {
 pub const READ_HOLD: Duration = Duration::from_millis(1);
 
 pub(crate) struct Shared {
+    budget: Option<Arc<FrameBudget>>,
     state: Mutex<State>,
     /// asks the ticker to poll smoltcp (data written/read by a flow, queue drained)
     pub(crate) poll_notify: Notify,
@@ -921,6 +942,9 @@ impl State {
             },
         );
         // An older socket of the tuple (closed, not yet removed) keeps its entry.
+        if let Some(budget) = &shared.budget {
+            budget.observe_tcp(self.entries.len());
+        }
         self.tuples.insert(tuple, key);
         Some(key)
     }
@@ -1313,6 +1337,9 @@ async fn reader<R: AsyncRead>(shared: &Arc<Shared>, rd: R) -> io::Result<()> {
         let spawn = {
             let mut st = shared.lock();
             for frame in frames {
+                if let Some(budget) = &shared.budget {
+                    budget.reserve(Direction::Rx, frame.len())?;
+                }
                 st.handle_frame(shared, frame);
             }
             let spawn = st.poll(shared);
@@ -1340,7 +1367,20 @@ async fn writer<W: AsyncWrite>(shared: &Arc<Shared>, wr: W) -> io::Result<()> {
             shared.tx_notify.notified().await;
             continue;
         };
-        wr.write_all(&chunk).await?;
+        if let Some(budget) = &shared.budget {
+            // The output queue batches complete u32-prefixed frames. Reserve each
+            // independently so a large batch cannot discard a fitting prefix.
+            let mut frames = chunk.as_ref();
+            while !frames.is_empty() {
+                let length = u32::from_be_bytes(frames[..4].try_into().unwrap()) as usize;
+                let (frame, rest) = frames.split_at(4 + length);
+                budget.reserve(Direction::Tx, length)?;
+                wr.write_all(frame).await?;
+                frames = rest;
+            }
+        } else {
+            wr.write_all(&chunk).await?;
+        }
         wr.flush().await?;
         let mut st = shared.lock();
         st.device.tx_inflight = 0;
@@ -1356,8 +1396,15 @@ async fn ticker(shared: &Arc<Shared>) {
     loop {
         let deadline = {
             let mut st = shared.lock();
-            st.armed = st.next_poll;
-            st.next_poll
+            let deadline = if let Some(budget) = &shared.budget {
+                budget.heartbeat();
+                let next_heartbeat = Instant::now() + FRAME_HEARTBEAT;
+                Some(st.next_poll.unwrap_or(next_heartbeat).min(next_heartbeat))
+            } else {
+                st.next_poll
+            };
+            st.armed = deadline;
+            deadline
         };
         match deadline {
             Some(deadline) => {

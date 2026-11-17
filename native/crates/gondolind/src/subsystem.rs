@@ -123,6 +123,7 @@ pub struct SubsystemContext {
     /// enabled debug components
     pub debug: Vec<String>,
     pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
+    pub frame_budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
 }
 
 impl SubsystemContext {

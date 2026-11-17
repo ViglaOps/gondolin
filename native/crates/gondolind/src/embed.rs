@@ -28,6 +28,8 @@ pub struct EmbeddedOptions {
     /// resolver is authoritative, including on errors. Guest DNS stays under
     /// the netstack configuration.
     pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
+    /// Optional single-attachment frame budget with a direct terminal notification.
+    pub frame_budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
 }
 
 /// A running in-process session.

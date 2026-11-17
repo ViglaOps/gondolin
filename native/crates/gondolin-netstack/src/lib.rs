@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub mod budget;
 pub mod config;
 pub mod dhcp;
 pub mod dns;

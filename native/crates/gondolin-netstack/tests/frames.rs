@@ -622,3 +622,81 @@ async fn guest_dns_servers_match_the_dhcp_offer() {
     assert_eq!(stack(DnsMode::Open, vec![resolver]).guest_dns_servers(), vec![resolver]);
     assert_eq!(stack(DnsMode::Open, vec![]).guest_dns_servers(), vec![Ipv4Addr::new(8, 8, 8, 8)]);
 }
+
+#[tokio::test]
+async fn frame_budget_charges_whole_frames_in_both_directions() {
+    use gondolin_netstack::budget::{FrameBudget, FrameState};
+
+    let arp = arp_request(GATEWAY_IP);
+    let n = arp.len() as u64;
+    for limit in [2 * n - 1, 2 * n, 2 * n + 13] {
+        let budget = Arc::new(FrameBudget::new(limit));
+        let stack = Arc::new(
+            NetStack::with_options(
+                Default::default(),
+                Arc::new(EchoHandler),
+                Some(vec![]),
+                Some(budget.clone()),
+            )
+            .unwrap(),
+        );
+        let (guest, host) = tokio::io::duplex(4096);
+        let driver = stack.clone();
+        let mut h = Harness {
+            pipe: Some(guest),
+            serve: tokio::spawn(async move { driver.serve(host).await }),
+            stack,
+        };
+        let mut guest = RawGuest::new(&mut h);
+        guest.send(&arp).await;
+        if limit >= 2 * n {
+            assert_eq!(guest.recv().await.len(), arp.len());
+            // This frame will be dropped by L2 parsing but still costs 13 bytes.
+            guest.send(&[0; 13]).await;
+            if limit > 2 * n {
+                guest.send(&[0]).await;
+            }
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(2), budget.stopped()).await.unwrap();
+        assert_eq!(stopped, FrameState::Exhausted);
+        assert!(h.serve.await.unwrap().is_err());
+        assert!(guest.recv_within(Duration::from_millis(50)).await.is_none());
+        let stats = budget.snapshot();
+        assert_eq!(stats.rx_bytes, if limit > 2 * n { n + 13 } else { n });
+        assert_eq!(stats.tx_bytes, if limit >= 2 * n { n } else { 0 });
+        let (_guest, new_host) = tokio::io::duplex(64);
+        assert!(h.stack.serve(new_host).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn monitored_idle_driver_heartbeats_and_latches_disconnect() {
+    use gondolin_netstack::budget::{FrameBudget, FrameState};
+    let budget = Arc::new(FrameBudget::new(1024));
+    let stack = NetStack::with_options(
+        Default::default(),
+        Arc::new(EchoHandler),
+        Some(vec![]),
+        Some(budget.clone()),
+    )
+    .unwrap();
+    let (guest, host) = tokio::io::duplex(512);
+    let driver = tokio::spawn(async move { stack.serve(host).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut first = None;
+        loop {
+            if let Some(now) = budget.snapshot().last_heartbeat {
+                let previous = *first.get_or_insert(now);
+                if now > previous {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(guest);
+    assert!(driver.await.unwrap().is_ok());
+    assert_eq!(budget.stopped().await, FrameState::Disconnected);
+}

@@ -228,14 +228,15 @@ impl Net {
         controller: Arc<R>,
         activity: Option<ActivityHandle>,
     ) -> Result<Self, NetError> {
-        Self::with_resolver(config, controller, activity, None)
+        Self::with_options(config, controller, activity, None, None)
     }
 
-    fn with_resolver<R: ControllerRequests>(
+    fn with_options<R: ControllerRequests>(
         config: ConfigureNet,
         controller: Arc<R>,
         activity: Option<ActivityHandle>,
         resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
+        budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
     ) -> Result<Self, NetError> {
         let ssh = match &config.egress.ssh {
             Some(ssh) => {
@@ -260,16 +261,10 @@ impl Net {
         .with_ssh_proxy(ssh);
         let handler =
             Arc::new(ActivityFlows { inner: egress.clone(), open: AtomicUsize::new(0), activity });
-        let stack = match config.system_resolvers {
-            Some(list) => {
-                let resolvers = list
-                    .iter()
-                    .filter_map(|s| s.split('%').next()?.parse::<Ipv4Addr>().ok())
-                    .collect();
-                NetStack::with_system_resolvers(config.stack, handler, resolvers)?
-            }
-            None => NetStack::new(config.stack, handler)?,
-        };
+        let resolvers = config.system_resolvers.map(|list| {
+            list.iter().filter_map(|s| s.split('%').next()?.parse::<Ipv4Addr>().ok()).collect()
+        });
+        let stack = NetStack::with_options(config.stack, handler, resolvers, budget)?;
         Ok(Self { stack: Arc::new(stack), egress, hooks })
     }
 
@@ -480,11 +475,12 @@ pub fn build_native(config: &Value, ctx: &SubsystemContext) -> Result<NetSetup, 
             Some(proto::MitmCaConfig { cert_pem: ca.cert_pem, key_pem: ca.key_pem });
     }
     let net = Arc::new(
-        Net::with_resolver(
+        Net::with_options(
             config,
             ctx.ctl.clone(),
             Some(ctx.activity.clone()),
             ctx.upstream_resolver.clone(),
+            ctx.frame_budget.clone(),
         )
         .map_err(|e| e.to_string())?,
     );
@@ -621,8 +617,9 @@ mod tests {
             "system_resolvers": [],
         }));
         let resolver = Arc::new(Deny(AtomicUsize::new(0)));
-        let net = Net::with_resolver(cfg, Arc::new(Fake::default()), None, Some(resolver.clone()))
-            .unwrap();
+        let net =
+            Net::with_options(cfg, Arc::new(Fake::default()), None, Some(resolver.clone()), None)
+                .unwrap();
         let (mut guest, host) = tokio::io::duplex(4096);
         let flow = TcpFlow::new(
             FlowMeta {
