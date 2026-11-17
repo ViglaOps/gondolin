@@ -497,3 +497,77 @@ async fn websocket_prechecked_request_policy_runs_once() {
         .await;
     assert_eq!(fake.log(), vec!["is_request_allowed GET -".to_string()]);
 }
+
+#[tokio::test]
+async fn remote_hook_receives_original_tls_request_on_each_hop() {
+    use gondolin_egress::{BoxFuture, ControllerLink, RemoteHooks};
+    use gondolin_proto::net::{BodyChunk, BodyPull, HookCall, HookDecision};
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<HookCall>>);
+    impl ControllerLink for Capture {
+        fn hook_call<'a>(&'a self, call: HookCall) -> BoxFuture<'a, Result<HookDecision, String>> {
+            self.0.lock().unwrap().push(call);
+            Box::pin(async { Ok(HookDecision::Continue) })
+        }
+        fn body_pull<'a>(&'a self, _: BodyPull) -> BoxFuture<'a, Result<BodyChunk, String>> {
+            unreachable!()
+        }
+        fn body_release(&self, _: u64) {}
+    }
+
+    let ca = TestCa::new("context test");
+    let receiver = upstream(
+        handler(|req| async move {
+            if req.uri().path() == "/final" {
+                Response::new(body("done"))
+            } else {
+                Response::builder().status(303).header("location", "/final").body(body("")).unwrap()
+            }
+        }),
+        Some(ca.server_config(&["service.test"])),
+    )
+    .await;
+    let calls = Arc::new(Capture::default());
+    let regs = HookRegistrations {
+        on_request: Some(BodyHookRegistration { body: true }),
+        ..Default::default()
+    };
+    let remote = RemoteHooks::new(calls.clone(), regs);
+    let mut cfg = config(Some(open_rules()), Some(&ca));
+    cfg.request_context = true;
+    let h = Harness::new(cfg, Arc::new(remote));
+    let mut client = h.tls(&ca, "proxy.test").await;
+    let target = format!("https://service.test:{}/a%2Fb?k=1&k=2", receiver.port());
+    let request = format!(
+        "POST {target} HTTP/1.1\r\nHost: proxy.test\r\nX-Test: one\r\nX-Test: two\r\nContent-Length: 3\r\n\r\nabc"
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+    assert_eq!(parse(&read_to_end(&mut client).await).text(), "done");
+    let calls = calls.0.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    for (hop, call) in calls.iter().enumerate() {
+        let ctx = call.original.as_ref().unwrap();
+        assert_eq!(ctx.flow_id, 1);
+        assert_eq!(ctx.sni.as_deref(), Some("proxy.test"));
+        assert_eq!(ctx.destination_port, 443);
+        assert_eq!((&*ctx.scheme, &*ctx.version, &*ctx.method), ("https", "HTTP/1.1", "POST"));
+        assert_eq!(ctx.target, target);
+        assert_eq!(
+            ctx.headers,
+            [
+                ("host".into(), "proxy.test".into()),
+                ("x-test".into(), "one".into()),
+                ("x-test".into(), "two".into()),
+                ("content-length".into(), "3".into())
+            ]
+        );
+        assert_eq!(ctx.redirect_hop, hop as u32);
+    }
+    let head = calls[0].request.as_ref().unwrap();
+    assert!(head.body.is_some());
+    assert!(head.body_prefix.is_none());
+    assert!(!head.body_complete);
+    assert_eq!(calls[1].request.as_ref().unwrap().method, "GET");
+}

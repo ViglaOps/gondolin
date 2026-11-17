@@ -29,6 +29,8 @@ gondolin_wire::wire_struct! {
         pub tcp_hosts: Vec<TcpHostMapping> = NetConfig::default().tcp_hosts => skip_if Vec::is_empty,
         /// SSH egress (sniffed `SSH-` banners); absent: SSH is not recognized
         pub ssh: Option<SshEgressConfig>,
+        /// include the unnormalized guest request head in on_request callbacks
+        pub request_context: bool = false => skip_if std::ops::Not::not,
         /// follow upstream redirects inside the engine (default: true)
         pub follow_redirects: bool = NetConfig::default().follow_redirects,
         /// extra PEM CA certificates trusted for upstream TLS (tests, corporate CAs)
@@ -51,6 +53,7 @@ impl Default for NetConfig {
             tcp_hosts: Vec::new(),
             ssh: None,
             upstream_ca_pems: Vec::new(),
+            request_context: false,
             follow_redirects: true,
             use_system_roots: true,
             use_webpki_roots: true,
@@ -467,10 +470,35 @@ gondolin_wire::wire_struct! {
 }
 
 gondolin_wire::wire_struct! {
+    /// Original guest HTTP request, captured before URL and header normalization.
+    /// Returned hook decisions cannot change this view. Its head is subject
+    /// to the same request-line and header bounds as the HTTP server.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct RequestContext {
+        /// guest TCP connection ID within this stack
+        pub flow_id: u64,
+        pub destination_port: u16,
+        pub scheme: String,
+        /// actual ClientHello SNI; absent on plaintext or if omitted by the client
+        pub sni: Option<String>,
+        pub version: String,
+        pub method: String,
+        /// request-target as received, including its original form and escapes
+        pub target: String,
+        /// original field occurrences in order, lowercase names and Latin-1 values
+        pub headers: Vec<(String, String)>,
+        /// zero for the guest request, incremented on engine-followed redirects
+        pub redirect_hop: u32,
+    }
+}
+
+gondolin_wire::wire_struct! {
     /// `hook_call` (d→c request, answered by `hook_call_result`).
     #[derive(Debug, Clone, PartialEq)]
     pub struct HookCall {
         pub phase: HookPhase,
+        /// engine-owned context for on_request, when requested in configure.net
+        pub original: Option<RequestContext>,
         /// request (all phases but `is_ip_allowed`; for `on_response` the final request, without body)
         pub request: Option<WireRequestHead>,
         /// upstream response (`on_response`)

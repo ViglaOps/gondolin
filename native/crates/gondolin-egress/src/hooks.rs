@@ -210,6 +210,16 @@ pub trait HookBackend: Send + Sync + 'static {
         Box::pin(async move { Ok(RequestDecision::Continue) })
     }
 
+    /// Request hook with an optional read-only view of the original guest head.
+    fn on_request_with_context<'a>(
+        &'a self,
+        request: RequestHead,
+        body: Option<BodyHandle>,
+        _context: Option<&'a gondolin_proto::net::RequestContext>,
+    ) -> crate::BoxFuture<'a, Result<RequestDecision, HookError>> {
+        self.on_request(request, body)
+    }
+
     /// Response hook (`onResponse`) with the final request head.
     fn on_response<'a>(
         &'a self,
@@ -361,6 +371,15 @@ impl HookBackend for ChainedHooks {
         request: RequestHead,
         body: Option<BodyHandle>,
     ) -> crate::BoxFuture<'a, Result<RequestDecision, HookError>> {
+        self.on_request_with_context(request, body, None)
+    }
+
+    fn on_request_with_context<'a>(
+        &'a self,
+        request: RequestHead,
+        body: Option<BodyHandle>,
+        context: Option<&'a gondolin_proto::net::RequestContext>,
+    ) -> crate::BoxFuture<'a, Result<RequestDecision, HookError>> {
         Box::pin(async move {
             let max = self.max_request_body_bytes;
             let too_large =
@@ -371,7 +390,7 @@ impl HookBackend for ChainedHooks {
             for t in &self.tiers {
                 let Some(reg) = t.registrations().on_request else { continue };
                 let handle = if reg.body { carried.handle(body.as_ref()) } else { None };
-                match t.on_request(head.clone(), handle).await {
+                match t.on_request_with_context(head.clone(), handle, context).await {
                     Ok(RequestDecision::Continue) => {}
                     Ok(RequestDecision::Request { head: h, body: choice }) => {
                         head = h;

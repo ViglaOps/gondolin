@@ -30,6 +30,7 @@ pub(crate) async fn handle_websocket(
     upgrade: Option<OnUpgrade>,
     base: RequestHead,
     prechecked: bool,
+    original: Option<&gondolin_proto::net::RequestContext>,
 ) -> Result<Response, PipelineError> {
     if version != Version::Http11 {
         return Err(
@@ -42,7 +43,8 @@ pub(crate) async fn handle_websocket(
 
     let regs = shared.engine.registrations();
     let policy = shared.engine.policy();
-    let outcome = apply_request_hooks(shared, &regs, &policy, base.clone(), ReqBody::Empty).await?;
+    let outcome =
+        apply_request_hooks(shared, &regs, &policy, base.clone(), ReqBody::Empty, original).await?;
     let (mut hooked, hooked_body) = match outcome {
         RequestHookOutcome::ShortCircuit { head, body } => {
             return Ok(guest_response(ctx, normalize_hook_response(head, body, &base.method)));

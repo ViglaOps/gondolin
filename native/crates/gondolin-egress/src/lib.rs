@@ -98,6 +98,7 @@ pub(crate) struct Shared {
     pub tls_client: Arc<rustls::ClientConfig>,
     pub mitm: Option<Arc<MitmAuthority>>,
     pub concurrency: Arc<Semaphore>,
+    pub request_context: bool,
     pub follow_redirects: bool,
     pub tcp_hosts: Vec<TcpHostMapping>,
     /// SSH sniff ports and proxy (set once at startup)
@@ -164,6 +165,7 @@ impl Egress {
                 tls_client: tls,
                 mitm,
                 concurrency,
+                request_context: config.request_context,
                 follow_redirects: config.follow_redirects,
                 tcp_hosts: config.tcp_hosts,
                 ssh: std::sync::RwLock::new(SshState {
@@ -280,7 +282,7 @@ impl FlowHandler for Egress {
                     deny(&control, &meta.src, &meta.dst, id, "connect-not-allowed");
                 }
                 Classification::Http { .. } => {
-                    http::serve_http(shared, prefixed, http::Scheme::Http, id).await;
+                    http::serve_http(shared, prefixed, http::Scheme::Http, &meta, None).await;
                 }
                 Classification::Tls => {
                     let Some(mitm) = shared.mitm.clone() else {
@@ -295,11 +297,8 @@ impl FlowHandler for Egress {
                             return;
                         }
                     };
-                    let servername = start
-                        .client_hello()
-                        .server_name()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| meta.dst.ip().to_string());
+                    let sni = start.client_hello().server_name().map(str::to_string);
+                    let servername = sni.clone().unwrap_or_else(|| meta.dst.ip().to_string());
                     gondolin_log::debug!(target: "gondolin::egress", "tls sni {servername} flow={}", id);
                     let name = servername.clone();
                     let config = match tokio::task::spawn_blocking(move || {
@@ -326,7 +325,7 @@ impl FlowHandler for Egress {
                             return;
                         }
                     };
-                    http::serve_http(shared, tls, http::Scheme::Https, id).await;
+                    http::serve_http(shared, tls, http::Scheme::Https, &meta, sni.as_deref()).await;
                 }
                 Classification::Ssh => {
                     let Some(proxy) = ssh.proxy else {

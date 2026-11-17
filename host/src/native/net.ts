@@ -74,6 +74,8 @@ export type NetConfigWire = {
   upstream_ca_pems?: string[];
   /** Whether to follow upstream HTTP redirects in the engine (default true) */
   follow_redirects?: boolean;
+  /** Include the original guest head in request hook calls */
+  request_context?: boolean;
   use_system_roots?: boolean;
   use_webpki_roots?: boolean;
 };
@@ -149,6 +151,18 @@ export type WireResponseHead = {
 };
 
 export type HookCallWire = {
+  /** Engine-owned guest request before normalization, when requested */
+  original?: {
+    flow_id: number;
+    destination_port: number;
+    scheme: string;
+    sni?: string;
+    version: string;
+    method: string;
+    target: string;
+    headers: Array<[string, string]>;
+    redirect_hop: number;
+  };
   phase: "is_request_allowed" | "is_ip_allowed" | "on_request" | "on_response";
   request?: WireRequestHead;
   response?: WireResponseHead;

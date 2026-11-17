@@ -188,6 +188,7 @@ impl HookBackend for RemoteHooks {
         Box::pin(async move {
             let call = HookCall {
                 phase: HookPhase::IsRequestAllowed,
+                original: None,
                 request: Some(wire_request(request, None)),
                 response: None,
                 ip: None,
@@ -207,6 +208,7 @@ impl HookBackend for RemoteHooks {
         Box::pin(async move {
             let call = HookCall {
                 phase: HookPhase::IsIpAllowed,
+                original: None,
                 request: None,
                 response: None,
                 ip: Some(WireIpInfo {
@@ -230,10 +232,20 @@ impl HookBackend for RemoteHooks {
         request: RequestHead,
         body: Option<BodyHandle>,
     ) -> crate::BoxFuture<'a, Result<RequestDecision, HookError>> {
+        self.on_request_with_context(request, body, None)
+    }
+
+    fn on_request_with_context<'a>(
+        &'a self,
+        request: RequestHead,
+        body: Option<BodyHandle>,
+        context: Option<&'a gondolin_proto::net::RequestContext>,
+    ) -> crate::BoxFuture<'a, Result<RequestDecision, HookError>> {
         Box::pin(async move {
             let (body_prefix, body_complete) = match &body {
-                Some(b) => inline_prefix(b, &request.headers).await,
-                None => (None, false),
+                // Context-aware hooks can validate the head before consuming body bytes.
+                Some(b) if context.is_none() => inline_prefix(b, &request.headers).await,
+                _ => (None, false),
             };
             let stream = body.map(|b| self.register_stream(b));
             let mut wire = wire_request(&request, stream);
@@ -241,6 +253,7 @@ impl HookBackend for RemoteHooks {
             wire.body_complete = body_complete;
             let call = HookCall {
                 phase: HookPhase::OnRequest,
+                original: context.cloned(),
                 request: Some(wire),
                 response: None,
                 ip: None,
@@ -276,6 +289,7 @@ impl HookBackend for RemoteHooks {
             let stream = body.map(|b| self.register_stream(b));
             let call = HookCall {
                 phase: HookPhase::OnResponse,
+                original: None,
                 request: Some(wire_request(&request, None)),
                 response: Some(WireResponseHead {
                     status: response.status,

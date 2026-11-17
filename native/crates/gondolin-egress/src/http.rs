@@ -16,7 +16,8 @@ use gondolin_http::url::Url;
 use gondolin_http::{
     Body as _, HeadLimits, Header, Incoming, ParseError, RequestHead as WireHead, Version,
 };
-use gondolin_proto::net::{HookRegistrations, NetPolicy};
+use gondolin_netstack::FlowMeta;
+use gondolin_proto::net::{HookRegistrations, NetPolicy, RequestContext};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Shared;
@@ -68,8 +69,13 @@ pub(crate) struct ReqCtx {
 }
 
 /// Serves HTTP/1.x on a guest stream until the connection ends.
-pub(crate) async fn serve_http<IO>(shared: Arc<Shared>, io: IO, scheme: Scheme, flow_id: u64)
-where
+pub(crate) async fn serve_http<IO>(
+    shared: Arc<Shared>,
+    io: IO,
+    scheme: Scheme,
+    flow: &FlowMeta,
+    sni: Option<&str>,
+) where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let ctx = ReqCtx { keep_alive: shared.limits.guest_keep_alive };
@@ -82,11 +88,11 @@ where
     gondolin_http::server::serve(
         io,
         config,
-        move |req| handle_request(svc_shared.clone(), scheme, req),
+        |req| handle_request(svc_shared.clone(), scheme, flow, sni, req),
         move |err| parse_error_response(&ctx, err),
     )
     .await;
-    gondolin_log::debug!(target: "gondolin::egress", "http connection ended flow={}", flow_id);
+    gondolin_log::debug!(target: "gondolin::egress", "http connection ended flow={}", flow.id);
 }
 
 /// Response to a request head the server could not parse.
@@ -138,13 +144,31 @@ struct Prepared {
     websocket: bool,
 }
 
-async fn handle_request(shared: Arc<Shared>, scheme: Scheme, req: Request) -> Response {
+async fn handle_request(
+    shared: Arc<Shared>,
+    scheme: Scheme,
+    flow: &FlowMeta,
+    sni: Option<&str>,
+    req: Request,
+) -> Response {
     let ctx = ReqCtx { keep_alive: shared.limits.guest_keep_alive };
     let Request { head, body: incoming, upgrade, .. } = req;
     let prepared = match prepare(&shared, scheme, &head, incoming).await {
         Ok(p) => p,
         Err(err) => return error_response(&ctx, err, 400),
     };
+    // prepare validated the size without modifying the parsed head.
+    let original = shared.request_context.then(|| RequestContext {
+        flow_id: flow.id,
+        destination_port: flow.dst.port(),
+        scheme: scheme.as_str().into(),
+        sni: sni.map(str::to_owned),
+        version: head.version.as_str().into(),
+        method: head.method.clone(),
+        target: head.target.clone(),
+        headers: head.headers.iter().map(|h| (h.name.clone(), latin1(&h.value))).collect(),
+        redirect_hop: 0,
+    });
     if prepared.websocket {
         return match crate::ws::handle_websocket(
             &shared,
@@ -153,6 +177,7 @@ async fn handle_request(shared: Arc<Shared>, scheme: Scheme, req: Request) -> Re
             upgrade,
             prepared.base,
             prepared.prechecked,
+            original.as_ref(),
         )
         .await
         {
@@ -162,7 +187,7 @@ async fn handle_request(shared: Arc<Shared>, scheme: Scheme, req: Request) -> Re
     }
     drop(upgrade);
     let permit = shared.concurrency.clone().acquire_owned().await.ok();
-    match fetch_and_respond(&shared, &ctx, prepared).await {
+    match fetch_and_respond(&shared, &ctx, prepared, original).await {
         Ok(mut resp) => {
             resp.body = with_guard(resp.body, permit);
             resp
@@ -412,6 +437,7 @@ pub(crate) async fn apply_request_hooks(
     policy: &NetPolicy,
     head: RequestHead,
     body: ReqBody,
+    context: Option<&RequestContext>,
 ) -> Result<RequestHookOutcome, PipelineError> {
     let limits = &shared.limits;
     let (mut head, body, original) = match regs.on_request {
@@ -435,7 +461,12 @@ pub(crate) async fn apply_request_hooks(
                 (None, Some(body))
             };
             let handle = pullable.as_ref().map(PullableBody::handle);
-            let decision = match shared.engine.hooks().on_request(head.clone(), handle).await {
+            let decision = match shared
+                .engine
+                .hooks()
+                .on_request_with_context(head.clone(), handle, context)
+                .await
+            {
                 Ok(d) => d,
                 Err(e) => {
                     discard(pullable).await;
@@ -625,6 +656,7 @@ async fn fetch_and_respond(
     shared: &Shared,
     ctx: &ReqCtx,
     prepared: Prepared,
+    mut original_context: Option<RequestContext>,
 ) -> Result<Response, PipelineError> {
     let mut pending = prepared.base.clone();
     let mut body = prepared.body;
@@ -644,7 +676,18 @@ async fn fetch_and_respond(
                 let lookup_host = host.clone();
                 (host, tokio::spawn(async move { engine.lookup(&lookup_host).await }))
             });
-        let outcome = apply_request_hooks(shared, &regs, &policy, pending.clone(), body).await?;
+        if let Some(ctx) = original_context.as_mut() {
+            ctx.redirect_hop = redirect_count as u32;
+        }
+        let outcome = apply_request_hooks(
+            shared,
+            &regs,
+            &policy,
+            pending.clone(),
+            body,
+            original_context.as_ref(),
+        )
+        .await?;
         let (head, hop_body, original) = match outcome {
             RequestHookOutcome::ShortCircuit { head, body } => {
                 return Ok(guest_response(

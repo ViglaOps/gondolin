@@ -567,6 +567,7 @@ mod tests {
         let link = Link(fake.clone());
         let decision = link
             .hook_call(HookCall {
+                original: None,
                 phase: proto::HookPhase::IsRequestAllowed,
                 request: None,
                 response: None,
