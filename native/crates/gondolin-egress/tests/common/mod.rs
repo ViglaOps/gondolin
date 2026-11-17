@@ -256,7 +256,7 @@ impl Harness {
                 id: 1,
                 src: "192.168.127.3:40000".parse().unwrap(),
                 dst: SocketAddr::new("192.0.2.1".parse().unwrap(), dst_port),
-                synthetic_hostname: None,
+                synthetic_hostname: Some("original-destination.test".into()),
             },
             stream: Box::pin(host),
             control: FlowControl::new(abort.clone()),

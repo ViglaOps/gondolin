@@ -550,6 +550,7 @@ async fn remote_hook_receives_original_tls_request_on_each_hop() {
     for (hop, call) in calls.iter().enumerate() {
         let ctx = call.original.as_ref().unwrap();
         assert_eq!(ctx.flow_id, 1);
+        assert_eq!(ctx.destination_hostname.as_deref(), Some("original-destination.test"));
         assert_eq!(ctx.sni.as_deref(), Some("proxy.test"));
         assert_eq!(ctx.destination_port, 443);
         assert_eq!((&*ctx.scheme, &*ctx.version, &*ctx.method), ("https", "HTTP/1.1", "POST"));

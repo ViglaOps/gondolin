@@ -477,6 +477,8 @@ gondolin_wire::wire_struct! {
     pub struct RequestContext {
         /// guest TCP connection ID within this stack
         pub flow_id: u64,
+        /// Original guest DNS mapping for the connected address, when using per-host synthetic DNS.
+        pub destination_hostname: Option<String>,
         pub destination_port: u16,
         pub scheme: String,
         /// actual ClientHello SNI; absent on plaintext or if omitted by the client

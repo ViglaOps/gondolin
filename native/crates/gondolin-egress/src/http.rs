@@ -166,6 +166,7 @@ async fn handle_request(
     // prepare validated the size without modifying the parsed head.
     let original = shared.request_context.then(|| RequestContext {
         flow_id: flow.id,
+        destination_hostname: flow.synthetic_hostname.clone(),
         destination_port: flow.dst.port(),
         scheme: scheme.as_str().into(),
         sni: sni.map(str::to_owned),
