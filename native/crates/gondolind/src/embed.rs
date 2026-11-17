@@ -24,6 +24,10 @@ pub struct EmbeddedOptions {
     /// Relative paths require a stable working directory (including in the
     /// VMM child). Keep the socket names within the platform sun_path limit.
     pub runtime_directory: Option<PathBuf>,
+    /// Hostname resolver for native upstream HTTP(S) connections. An injected
+    /// resolver is authoritative, including on errors. Guest DNS stays under
+    /// the netstack configuration.
+    pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
 }
 
 /// A running in-process session.
@@ -48,7 +52,7 @@ impl Embedded {
         dispatcher.register(mitm_ca::MITM_CA, Arc::new(mitm_ca::MitmCaHandler));
         let (mut session, channels) =
             Session::new(ctl.clone(), dispatcher.clone(), HostInfo::detect());
-        session.runtime_directory = options.runtime_directory;
+        session.embedded = options;
         let (session_tx, session_rx) = mpsc::channel(64);
         let session_task = tokio::spawn(session.run(channels, session_rx));
         // fail closed like the daemon: a panicking session kills the VMM and

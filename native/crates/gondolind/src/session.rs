@@ -219,7 +219,7 @@ pub struct Session {
     base_append: String,
     vfs: Option<Arc<dyn VfsBackend>>,
     net: NetSetup,
-    pub(crate) runtime_directory: Option<PathBuf>,
+    pub(crate) embedded: crate::embed::EmbeddedOptions,
     runtime: Option<Runtime>,
     boot_shared: Arc<Mutex<Option<SandboxFsConfig>>>,
 
@@ -290,7 +290,7 @@ impl Session {
             base_append: String::new(),
             vfs: None,
             net: NetSetup::None,
-            runtime_directory: None,
+            embedded: Default::default(),
             runtime: None,
             boot_shared: Arc::new(Mutex::new(None)),
             clients: OrderedSet::new(),
@@ -644,6 +644,7 @@ impl Session {
             dispatcher: self.dispatcher.clone(),
             activity: ActivityHandle { events: self.events.clone() },
             debug: cfg.debug.clone(),
+            upstream_resolver: self.embedded.upstream_resolver.clone(),
         };
         let vfs = subsystem::build_vfs(cfg.vfs.as_ref(), &ctx)?;
         let net = subsystem::build_net(cfg.net.as_ref(), &ctx)?;
@@ -717,7 +718,7 @@ impl Session {
     }
 
     fn start_runtime(&mut self) -> Result<(), String> {
-        let dir = make_socket_dir(self.runtime_directory.as_deref())
+        let dir = make_socket_dir(self.embedded.runtime_directory.as_deref())
             .map_err(|e| format!("cannot create socket directory: {e}"))?;
         if let Some(cfg) = self.configured.as_mut() {
             let krun = qemu::is_krun(&cfg.vm);

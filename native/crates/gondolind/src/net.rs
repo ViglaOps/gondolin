@@ -228,6 +228,15 @@ impl Net {
         controller: Arc<R>,
         activity: Option<ActivityHandle>,
     ) -> Result<Self, NetError> {
+        Self::with_resolver(config, controller, activity, None)
+    }
+
+    fn with_resolver<R: ControllerRequests>(
+        config: ConfigureNet,
+        controller: Arc<R>,
+        activity: Option<ActivityHandle>,
+        resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
+    ) -> Result<Self, NetError> {
         let ssh = match &config.egress.ssh {
             Some(ssh) => {
                 let proxy = gondolin_sshproxy::SshProxy::new(
@@ -244,7 +253,11 @@ impl Net {
         let hooks =
             Arc::new(RemoteHooks::new(Arc::new(Link(controller)), config.egress.hooks.clone()));
         let backend = hook_tiers(&config.egress, hooks.clone())?;
-        let egress = Egress::new(config.egress, backend)?.with_ssh_proxy(ssh);
+        let egress = match resolver {
+            Some(resolver) => Egress::with_resolver(config.egress, backend, resolver),
+            None => Egress::new(config.egress, backend),
+        }?
+        .with_ssh_proxy(ssh);
         let handler =
             Arc::new(ActivityFlows { inner: egress.clone(), open: AtomicUsize::new(0), activity });
         let stack = match config.system_resolvers {
@@ -467,8 +480,13 @@ pub fn build_native(config: &Value, ctx: &SubsystemContext) -> Result<NetSetup, 
             Some(proto::MitmCaConfig { cert_pem: ca.cert_pem, key_pem: ca.key_pem });
     }
     let net = Arc::new(
-        Net::with_activity(config, ctx.ctl.clone(), Some(ctx.activity.clone()))
-            .map_err(|e| e.to_string())?,
+        Net::with_resolver(
+            config,
+            ctx.ctl.clone(),
+            Some(ctx.activity.clone()),
+            ctx.upstream_resolver.clone(),
+        )
+        .map_err(|e| e.to_string())?,
     );
     let messages = Arc::new(NetMessages(net.clone()));
     for t in [proto::types::POLICY_UPDATE, proto::types::BODY_PULL, proto::types::BODY_RELEASE] {
@@ -577,6 +595,68 @@ mod tests {
             .unwrap();
         assert_eq!(decision, HookDecision::Allowed { allowed: false });
         assert_eq!(fake.requests.lock().unwrap()[0].0, "hook_call");
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_errors_prevent_upstream_connections() {
+        use gondolin_netstack::FlowMeta;
+        use std::io;
+        use std::net::IpAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct Deny(AtomicUsize);
+        impl gondolin_egress::Resolver for Deny {
+            fn lookup<'a>(
+                &'a self,
+                host: &'a str,
+            ) -> crate::BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+                assert_eq!(host, "localhost");
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Err(io::Error::other("fixture denied resolution")) })
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = decode_config(gondolin_wire::value!({
+            "policy": { "rules": { "allowed_hosts": ["localhost"], "allowed_internal_hosts": ["localhost"] } },
+            "system_resolvers": [],
+        }));
+        let resolver = Arc::new(Deny(AtomicUsize::new(0)));
+        let net = Net::with_resolver(cfg, Arc::new(Fake::default()), None, Some(resolver.clone()))
+            .unwrap();
+        let (mut guest, host) = tokio::io::duplex(4096);
+        let flow = TcpFlow::new(
+            FlowMeta {
+                id: 1,
+                src: "192.0.2.2:2000".parse().unwrap(),
+                dst: "192.0.2.1:80".parse().unwrap(),
+                synthetic_hostname: None,
+            },
+            host,
+        );
+        let egress = net.egress().clone();
+        let task = tokio::spawn(async move { egress.handle_tcp(flow).await });
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            listener.local_addr().unwrap().port()
+        );
+        guest.write_all(request.as_bytes()).await.unwrap();
+        guest.shutdown().await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            guest.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"));
+        assert!(resolver.0.load(Ordering::Relaxed) > 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        task.await.unwrap();
     }
 
     #[test]

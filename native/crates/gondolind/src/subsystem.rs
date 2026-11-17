@@ -122,6 +122,7 @@ pub struct SubsystemContext {
     pub activity: ActivityHandle,
     /// enabled debug components
     pub debug: Vec<String>,
+    pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
 }
 
 impl SubsystemContext {
