@@ -98,6 +98,7 @@ pub(crate) struct Shared {
     pub tls_client: Arc<rustls::ClientConfig>,
     pub mitm: Option<Arc<MitmAuthority>>,
     pub concurrency: Arc<Semaphore>,
+    pub follow_redirects: bool,
     pub tcp_hosts: Vec<TcpHostMapping>,
     /// SSH sniff ports and proxy (set once at startup)
     pub ssh: std::sync::RwLock<SshState>,
@@ -163,6 +164,7 @@ impl Egress {
                 tls_client: tls,
                 mitm,
                 concurrency,
+                follow_redirects: config.follow_redirects,
                 tcp_hosts: config.tcp_hosts,
                 ssh: std::sync::RwLock::new(SshState {
                     ports: config.ssh.map(|s| s.ports).unwrap_or_default(),

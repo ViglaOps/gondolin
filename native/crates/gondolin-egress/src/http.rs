@@ -686,6 +686,7 @@ async fn fetch_and_respond(
         let (upstream_body, recording) = match hop_body {
             ReqBody::Empty => (body::empty(), None),
             ReqBody::Bytes(b) => (body::full(b.clone()), Some(Ok(b))),
+            ReqBody::Stream(s) if !shared.follow_redirects => (s, None),
             ReqBody::Stream(s) => {
                 let (rec, record) = RecordingBody::new(s, REDIRECT_REPLAY_LIMIT);
                 (HookBody::new(rec), Some(Err(record)))
@@ -705,7 +706,9 @@ async fn fetch_and_respond(
         };
 
         let status = response.head.status;
-        if let Some(target) = redirect_target(status, &response.head.headers, &url) {
+        if shared.follow_redirects
+            && let Some(target) = redirect_target(status, &response.head.headers, &url)
+        {
             drop(response);
             if redirect_count >= MAX_HTTP_REDIRECTS {
                 return Err(Blocked::new(508, "Loop Detected", "too many redirects").into());

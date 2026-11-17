@@ -72,6 +72,8 @@ export type NetConfigWire = {
   }>;
   ssh?: SshEgressConfigWire;
   upstream_ca_pems?: string[];
+  /** Whether to follow upstream HTTP redirects in the engine (default true) */
+  follow_redirects?: boolean;
   use_system_roots?: boolean;
   use_webpki_roots?: boolean;
 };

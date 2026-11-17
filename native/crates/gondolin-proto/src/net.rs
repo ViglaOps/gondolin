@@ -29,6 +29,8 @@ gondolin_wire::wire_struct! {
         pub tcp_hosts: Vec<TcpHostMapping> = NetConfig::default().tcp_hosts => skip_if Vec::is_empty,
         /// SSH egress (sniffed `SSH-` banners); absent: SSH is not recognized
         pub ssh: Option<SshEgressConfig>,
+        /// follow upstream redirects inside the engine (default: true)
+        pub follow_redirects: bool = NetConfig::default().follow_redirects,
         /// extra PEM CA certificates trusted for upstream TLS (tests, corporate CAs)
         pub upstream_ca_pems: Vec<String> = NetConfig::default().upstream_ca_pems => skip_if Vec::is_empty,
         /// whether to also trust the operating system's root store upstream
@@ -49,6 +51,7 @@ impl Default for NetConfig {
             tcp_hosts: Vec::new(),
             ssh: None,
             upstream_ca_pems: Vec::new(),
+            follow_redirects: true,
             use_system_roots: true,
             use_webpki_roots: true,
         }

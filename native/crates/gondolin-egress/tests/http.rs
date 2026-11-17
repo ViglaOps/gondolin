@@ -561,6 +561,44 @@ async fn redirects_are_followed_and_revalidated() {
 }
 
 #[tokio::test]
+async fn disabled_redirects_return_first_response_without_a_second_request() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = requests.clone();
+    let addr = upstream(
+        handler(move |req| {
+            received.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(body_bytes(req).await.as_ref(), b"abc");
+                Response::builder()
+                    .status(307)
+                    .header("Location", "/next")
+                    .body(body("redirect body"))
+                    .unwrap()
+            }
+        }),
+        None,
+    )
+    .await;
+    let mut cfg = config(Some(open_rules()), None);
+    cfg.follow_redirects = false;
+    let h = Harness::new(cfg, Arc::new(gondolin_egress::NoHooks));
+    let r = parse(
+        &h.raw(
+            format!(
+                "POST / HTTP/1.1\r\nHost: a.test:{}\r\nContent-Length: 3\r\n\r\nabc",
+                addr.port()
+            )
+            .as_bytes(),
+        )
+        .await,
+    );
+    assert_eq!(r.status, 307);
+    assert_eq!(r.header("location"), Some("/next"));
+    assert_eq!(r.text(), "redirect body");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn upstream_connect_failure_is_502() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
