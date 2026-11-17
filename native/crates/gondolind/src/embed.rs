@@ -3,6 +3,7 @@
 //! pipe). Used by the static `gondolin` CLI (`gondolin-cli`); the protocol
 //! is the one the TypeScript controller speaks over stdio.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gondolin_wire::RawEnvelope;
@@ -13,6 +14,17 @@ use crate::controller::{Controller, Dispatcher};
 use crate::qemu::HostInfo;
 use crate::session::Session;
 use crate::{mitm_ca, panics, vmm};
+
+/// Host-controlled options for an in-process session.
+#[derive(Default)]
+pub struct EmbeddedOptions {
+    /// Exact directory for this session's sockets and temporary disk. Its
+    /// parent must exist and be trusted. On start the engine exclusively
+    /// creates the directory with mode 0700 and removes it on teardown.
+    /// Relative paths require a stable working directory (including in the
+    /// VMM child). Keep the socket names within the platform sun_path limit.
+    pub runtime_directory: Option<PathBuf>,
+}
 
 /// A running in-process session.
 pub struct Embedded {
@@ -25,11 +37,18 @@ pub struct Embedded {
 impl Embedded {
     /// Starts a session. The first message from [`Embedded::next`] is `hello`.
     pub fn start() -> Embedded {
+        Self::start_with_options(EmbeddedOptions::default())
+    }
+
+    /// Starts a session with caller-selected host resources.
+    pub fn start_with_options(options: EmbeddedOptions) -> Embedded {
         let ctl = Controller::new();
         let dispatcher = Dispatcher::default();
         crate::send_hello(&ctl);
         dispatcher.register(mitm_ca::MITM_CA, Arc::new(mitm_ca::MitmCaHandler));
-        let (session, channels) = Session::new(ctl.clone(), dispatcher.clone(), HostInfo::detect());
+        let (mut session, channels) =
+            Session::new(ctl.clone(), dispatcher.clone(), HostInfo::detect());
+        session.runtime_directory = options.runtime_directory;
         let (session_tx, session_rx) = mpsc::channel(64);
         let session_task = tokio::spawn(session.run(channels, session_rx));
         // fail closed like the daemon: a panicking session kills the VMM and

@@ -219,6 +219,7 @@ pub struct Session {
     base_append: String,
     vfs: Option<Arc<dyn VfsBackend>>,
     net: NetSetup,
+    pub(crate) runtime_directory: Option<PathBuf>,
     runtime: Option<Runtime>,
     boot_shared: Arc<Mutex<Option<SandboxFsConfig>>>,
 
@@ -289,6 +290,7 @@ impl Session {
             base_append: String::new(),
             vfs: None,
             net: NetSetup::None,
+            runtime_directory: None,
             runtime: None,
             boot_shared: Arc::new(Mutex::new(None)),
             clients: OrderedSet::new(),
@@ -715,7 +717,8 @@ impl Session {
     }
 
     fn start_runtime(&mut self) -> Result<(), String> {
-        let dir = make_socket_dir().map_err(|e| format!("cannot create socket directory: {e}"))?;
+        let dir = make_socket_dir(self.runtime_directory.as_deref())
+            .map_err(|e| format!("cannot create socket directory: {e}"))?;
         if let Some(cfg) = self.configured.as_mut() {
             let krun = qemu::is_krun(&cfg.vm);
             self.ckpt.overlay =
@@ -1624,7 +1627,12 @@ fn check_vmm_binary(vm: &gondolin_proto::session::VmConfig) -> Result<(), String
 
 /// Creates the private socket directory (mode 0700). macOS uses `/tmp`
 /// because of the short `sun_path` limit.
-fn make_socket_dir() -> std::io::Result<SocketDir> {
+fn make_socket_dir(requested: Option<&std::path::Path>) -> std::io::Result<SocketDir> {
+    if let Some(path) = requested {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        return Ok(SocketDir(path.to_owned()));
+    }
     let base: PathBuf = if cfg!(target_os = "macos") {
         PathBuf::from("/tmp")
     } else {
@@ -1643,4 +1651,25 @@ fn make_socket_dir() -> std::io::Result<SocketDir> {
     // SAFETY: mkdtemp only replaced the XXXXXX with filename characters.
     let path = PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes) });
     Ok(SocketDir(path))
+}
+
+#[cfg(test)]
+mod socket_dir_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn caller_selected_directory_is_exclusive_and_removed_on_drop() {
+        let parent = make_socket_dir(None).unwrap();
+        let path = parent.0.join("runtime");
+        let dir = make_socket_dir(Some(&path)).unwrap();
+        assert_eq!(dir.0, path);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(make_socket_dir(Some(&path)).is_err());
+        drop(dir);
+        assert!(!path.exists());
+        symlink(&parent.0, &path).unwrap();
+        assert!(make_socket_dir(Some(&path)).is_err());
+        assert!(path.is_symlink());
+    }
 }
