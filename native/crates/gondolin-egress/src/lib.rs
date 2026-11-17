@@ -14,6 +14,7 @@ mod body;
 mod classify;
 pub mod cli_policy;
 mod error;
+mod guard;
 mod headers;
 mod hooks;
 mod http;
@@ -48,6 +49,7 @@ pub use crate::error::{Blocked, BoxError};
 
 /// A boxed, sendable future (the async trait methods of egress).
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub use crate::guard::{EgressFailure, HttpEgressGuard};
 pub use crate::hooks::{
     BodyChoice, ChainedHooks, HookBackend, HookError, IpAllowInfo, NoHooks, RequestDecision,
     RequestHead, ResponseDecision, ResponseHead,
@@ -63,6 +65,7 @@ pub use crate::secrets::apply_secrets;
 /// Errors building an [`Egress`].
 #[derive(Debug)]
 pub enum EgressError {
+    UnsupportedGuardedTransport,
     Mitm(MitmError),
     Trust(upstream::TrustError),
 }
@@ -82,6 +85,9 @@ impl From<upstream::TrustError> for EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EgressError::UnsupportedGuardedTransport => {
+                f.write_str("guarded egress requires HTTP(S) only")
+            }
             EgressError::Mitm(e) => e.fmt(f),
             EgressError::Trust(e) => e.fmt(f),
         }
@@ -92,6 +98,7 @@ impl std::error::Error for EgressError {}
 
 /// Shared state of all flows.
 pub(crate) struct Shared {
+    guard: Option<Arc<HttpEgressGuard>>,
     pub engine: Arc<policy::PolicyEngine>,
     pub limits: NetLimits,
     pub client: upstream::UpstreamClient,
@@ -127,15 +134,33 @@ impl std::fmt::Debug for Egress {
 impl Egress {
     /// Builds the egress side from `configure.net` with the system resolver.
     pub fn new(config: NetConfig, hooks: Arc<dyn HookBackend>) -> Result<Self, EgressError> {
-        Self::with_resolver(config, hooks, Arc::new(CachingResolver::new(SystemResolver)))
+        Self::with_options(config, hooks, None, None)
     }
 
-    /// Like [`Egress::new`] with a custom host resolver (tests).
+    /// Like [`Egress::new`] with an authoritative host resolver.
     pub fn with_resolver(
         config: NetConfig,
         hooks: Arc<dyn HookBackend>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self, EgressError> {
+        Self::with_options(config, hooks, Some(resolver), None)
+    }
+
+    /// Builds native egress with optional authoritative DNS and terminal HTTP supervision.
+    pub fn with_options(
+        config: NetConfig,
+        hooks: Arc<dyn HookBackend>,
+        resolver: Option<Arc<dyn Resolver>>,
+        guard: Option<Arc<HttpEgressGuard>>,
+    ) -> Result<Self, EgressError> {
+        if guard.is_some()
+            && (!config.tcp_hosts.is_empty()
+                || config.ssh.is_some()
+                || config.policy.allow_websockets)
+        {
+            return Err(EgressError::UnsupportedGuardedTransport);
+        }
+        let resolver = resolver.unwrap_or_else(|| Arc::new(CachingResolver::new(SystemResolver)));
         let engine = Arc::new(policy::PolicyEngine::new(config.policy, hooks, resolver));
         let tls = upstream::client_tls_config(&upstream::TrustConfig {
             webpki_roots: config.use_webpki_roots,
@@ -145,7 +170,7 @@ impl Egress {
         let mut tls = tls;
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         let tls = Arc::new(tls);
-        let client = upstream::build_client(engine.clone(), tls.clone());
+        let client = upstream::build_client(engine.clone(), tls.clone(), guard.clone());
         let mitm = match &config.mitm {
             Some(ca) => Some(Arc::new(MitmAuthority::from_pem(
                 &ca.cert_pem,
@@ -159,6 +184,7 @@ impl Egress {
             Arc::new(Semaphore::new(config.limits.max_concurrent_requests.max(1) as usize));
         Ok(Self {
             shared: Arc::new(Shared {
+                guard,
                 engine,
                 limits: config.limits,
                 client,
@@ -179,6 +205,12 @@ impl Egress {
     /// Attaches the SSH egress proxy (SSH banners on its ports are handed to it).
     /// Applies to flows accepted afterwards.
     pub fn with_ssh_proxy(self, proxy: Option<gondolin_sshproxy::SshProxy>) -> Self {
+        if proxy.is_some()
+            && let Some(guard) = &self.shared.guard
+        {
+            guard.stop(EgressFailure::Policy);
+            return self;
+        }
         let mut ssh = self.shared.ssh.write().unwrap();
         if let Some(proxy) = &proxy {
             ssh.ports = proxy.sniff_ports();
@@ -191,6 +223,12 @@ impl Egress {
     /// Replaces the declarative policy (`policy_update`); applies to requests
     /// evaluated from now on.
     pub fn update_policy(&self, policy: NetPolicy) {
+        if policy.allow_websockets
+            && let Some(guard) = &self.shared.guard
+        {
+            guard.stop(EgressFailure::Policy);
+            return;
+        }
         self.shared.engine.set_policy(policy);
     }
 
@@ -218,6 +256,22 @@ fn mapped_target<'a>(
 
 impl FlowHandler for Egress {
     fn handle_tcp(&self, flow: TcpFlow) -> gondolin_netstack::BoxFuture<'_, ()> {
+        let Some(guard) = &self.shared.guard else {
+            return self.handle_flow(flow);
+        };
+        let control = flow.control.clone();
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = guard.stopped() => control.abort(),
+                _ = self.handle_flow(flow) => (),
+            }
+        })
+    }
+}
+
+impl Egress {
+    fn handle_flow(&self, flow: TcpFlow) -> gondolin_netstack::BoxFuture<'_, ()> {
         Box::pin(async move {
             let shared = self.shared.clone();
             let TcpFlow { meta, mut stream, control } = flow;
@@ -267,7 +321,7 @@ impl FlowHandler for Egress {
                     other => break other,
                 }
                 if buf.len() >= MAX_FLOW_SNIFF {
-                    deny(&control, &meta.src, &meta.dst, id, "sniff-limit-exceeded");
+                    deny(&shared.guard, &control, &meta.src, &meta.dst, id, "sniff-limit-exceeded");
                     return;
                 }
                 match stream.read_buf(&mut buf).await {
@@ -279,19 +333,29 @@ impl FlowHandler for Egress {
             let prefixed = Lingering::new(Prefixed { prefix: buf.freeze(), inner: stream });
             match class {
                 Classification::Http { method } if method == "CONNECT" => {
-                    deny(&control, &meta.src, &meta.dst, id, "connect-not-allowed");
+                    deny(&shared.guard, &control, &meta.src, &meta.dst, id, "connect-not-allowed");
                 }
                 Classification::Http { .. } => {
                     http::serve_http(shared, prefixed, http::Scheme::Http, &meta, None).await;
                 }
                 Classification::Tls => {
                     let Some(mitm) = shared.mitm.clone() else {
-                        deny(&control, &meta.src, &meta.dst, id, "tls-without-mitm-ca");
+                        deny(
+                            &shared.guard,
+                            &control,
+                            &meta.src,
+                            &meta.dst,
+                            id,
+                            "tls-without-mitm-ca",
+                        );
                         return;
                     };
                     let start = match gondolin_http::tls::read_client_hello(prefixed).await {
                         Ok(start) => start,
                         Err(err) => {
+                            if let Some(guard) = &shared.guard {
+                                guard.stop(EgressFailure::GuestTls);
+                            }
                             gondolin_log::debug!(target: "gondolin::egress", "tls client hello failed: {err} flow={}", id);
                             control.abort();
                             return;
@@ -308,11 +372,17 @@ impl FlowHandler for Egress {
                     {
                         Ok(Ok(config)) => config,
                         Ok(Err(err)) => {
+                            if let Some(guard) = &shared.guard {
+                                guard.stop(EgressFailure::GuestTls);
+                            }
                             gondolin_log::warn!(target: "gondolin::egress", "tls mitm for {servername} failed: {err} flow={}", id);
                             control.abort();
                             return;
                         }
                         Err(_) => {
+                            if let Some(guard) = &shared.guard {
+                                guard.stop(EgressFailure::GuestTls);
+                            }
                             control.abort();
                             return;
                         }
@@ -320,6 +390,9 @@ impl FlowHandler for Egress {
                     let tls = match start.into_stream(config).await {
                         Ok(tls) => tls,
                         Err(err) => {
+                            if let Some(guard) = &shared.guard {
+                                guard.stop(EgressFailure::GuestTls);
+                            }
                             gondolin_log::debug!(target: "gondolin::egress", "tls handshake failed: {err} flow={}", id);
                             control.abort();
                             return;
@@ -329,11 +402,11 @@ impl FlowHandler for Egress {
                 }
                 Classification::Ssh => {
                     let Some(proxy) = ssh.proxy else {
-                        deny(&control, &meta.src, &meta.dst, id, "ssh-not-enabled");
+                        deny(&shared.guard, &control, &meta.src, &meta.dst, id, "ssh-not-enabled");
                         return;
                     };
                     let Some(target) = proxy.target_for(&meta) else {
-                        deny(&control, &meta.src, &meta.dst, id, "policy-deny");
+                        deny(&shared.guard, &control, &meta.src, &meta.dst, id, "policy-deny");
                         return;
                     };
                     proxy
@@ -341,7 +414,7 @@ impl FlowHandler for Egress {
                         .await;
                 }
                 Classification::Deny | Classification::NeedMore => {
-                    deny(&control, &meta.src, &meta.dst, id, "unknown-protocol");
+                    deny(&shared.guard, &control, &meta.src, &meta.dst, id, "unknown-protocol");
                 }
             }
         })
@@ -349,12 +422,16 @@ impl FlowHandler for Egress {
 }
 
 fn deny(
+    guard: &Option<Arc<HttpEgressGuard>>,
     control: &gondolin_netstack::FlowControl,
     src: &SocketAddr,
     dst: &SocketAddr,
     id: u64,
     reason: &str,
 ) {
+    if let Some(guard) = guard {
+        guard.stop(EgressFailure::Protocol);
+    }
     gondolin_log::debug!(target: "gondolin::egress", "tcp blocked {src} -> {dst} ({reason}) flow={}", id);
     control.abort();
 }

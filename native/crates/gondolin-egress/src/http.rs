@@ -89,7 +89,13 @@ pub(crate) async fn serve_http<IO>(
         io,
         config,
         |req| handle_request(svc_shared.clone(), scheme, flow, sni, req),
-        move |err| parse_error_response(&ctx, err),
+        move |err| {
+            if let Some(guard) = &shared.guard {
+                guard.stop(crate::EgressFailure::Request);
+                return Response::new(400, vec![], body::empty());
+            }
+            parse_error_response(&ctx, err)
+        },
     )
     .await;
     gondolin_log::debug!(target: "gondolin::egress", "http connection ended flow={}", flow.id);
@@ -155,7 +161,7 @@ async fn handle_request(
     let Request { head, body: incoming, upgrade, .. } = req;
     let prepared = match prepare(&shared, scheme, &head, incoming).await {
         Ok(p) => p,
-        Err(err) => return error_response(&ctx, err, 400),
+        Err(err) => return pipeline_failure(&shared, &ctx, err, 400),
     };
     // prepare validated the size without modifying the parsed head.
     let original = shared.request_context.then(|| RequestContext {
@@ -182,7 +188,7 @@ async fn handle_request(
         .await
         {
             Ok(resp) => resp,
-            Err(err) => error_response(&ctx, err, 400),
+            Err(err) => pipeline_failure(&shared, &ctx, err, 400),
         };
     }
     drop(upgrade);
@@ -192,7 +198,7 @@ async fn handle_request(
             resp.body = with_guard(resp.body, permit);
             resp
         }
-        Err(err) => error_response(&ctx, err, 502),
+        Err(err) => pipeline_failure(&shared, &ctx, err, 502),
     }
 }
 
@@ -360,6 +366,15 @@ async fn prepare(
         base.remove_header("content-length");
         ReqBody::Empty
     };
+    let body = match (body, &shared.guard) {
+        (ReqBody::Stream(s), Some(guard)) => ReqBody::Stream(body::supervised_body(
+            s,
+            max,
+            guard.clone(),
+            crate::EgressFailure::Request,
+        )),
+        (body, _) => body,
+    };
     Ok(Prepared {
         base,
         guest_content_length: !chunked && content_length > 0,
@@ -410,7 +425,13 @@ async fn ensure_ip_allowed_with(
     shared.engine.resolve_allowed_from(host, protocol, port, ips).await
 }
 
-fn hook_error(err: HookError) -> PipelineError {
+fn hook_error(guard: &Option<Arc<crate::HttpEgressGuard>>, err: HookError) -> PipelineError {
+    if let Some(guard) = guard {
+        guard.stop(match &err {
+            HookError::Blocked(_) => crate::EgressFailure::Policy,
+            HookError::Failed(_) => crate::EgressFailure::Controller,
+        });
+    }
     match err {
         HookError::Blocked(b) => PipelineError::Blocked(b),
         HookError::Failed(msg) => PipelineError::Other(msg),
@@ -470,7 +491,7 @@ pub(crate) async fn apply_request_hooks(
                 Ok(d) => d,
                 Err(e) => {
                     discard(pullable).await;
-                    return Err(hook_error(e));
+                    return Err(hook_error(&shared.guard, e));
                 }
             };
             match decision {
@@ -666,7 +687,10 @@ async fn fetch_and_respond(
         let policy = shared.engine.policy();
         // resolve the host while the request hook round trip runs (the
         // result is only used if the hook keeps the host)
-        let prefetched = (regs.on_request.is_some() && !(first && prepared.prechecked))
+        // A supervised flow must own every lookup so cancellation drops it.
+        let prefetched = (shared.guard.is_none()
+            && regs.on_request.is_some()
+            && !(first && prepared.prechecked))
             .then(|| Url::parse(&pending.url).ok())
             .flatten()
             .and_then(|u| u.host_str().map(str::to_string))
@@ -744,7 +768,20 @@ async fn fetch_and_respond(
             upstream_body,
         );
         let response = match tokio::time::timeout(UPSTREAM_HEADERS_TIMEOUT, fetch).await {
-            Ok(r) => r.map_err(client_error)?,
+            Ok(r) => r.map_err(|e| {
+                if let Some(guard) = &shared.guard {
+                    let cause = match &e {
+                        ClientError::Tls(_) => crate::EgressFailure::UpstreamTls,
+                        ClientError::Connect(e) if e.is::<ConnectBlocked>() => {
+                            crate::EgressFailure::Policy
+                        }
+                        _ => crate::EgressFailure::Upstream,
+                    };
+                    guard.stop(cause);
+                    return PipelineError::plain(502, "Bad Gateway");
+                }
+                client_error(e)
+            })?,
             Err(_) => return Err(PipelineError::Other("upstream headers timeout".into())),
         };
 
@@ -812,6 +849,15 @@ async fn respond(
     head.set_header("connection", "close");
     let upstream_body = HookBody::new(IdleTimeoutBody::new(incoming, UPSTREAM_BODY_TIMEOUT));
 
+    let upstream_body = match &shared.guard {
+        Some(guard) => body::supervised_body(
+            upstream_body,
+            shared.limits.max_response_body_bytes,
+            guard.clone(),
+            crate::EgressFailure::Upstream,
+        ),
+        None => upstream_body,
+    };
     let is_head = request.method.eq_ignore_ascii_case("HEAD");
     let suppress = is_head || matches!(status, 204 | 205 | 304);
     if suppress {
@@ -829,7 +875,7 @@ async fn respond(
                 .hooks()
                 .on_response(head.clone(), None, request.clone())
                 .await
-                .map_err(hook_error)?;
+                .map_err(|e| hook_error(&shared.guard, e))?;
             let (h, b) = match decision {
                 ResponseDecision::Continue => (head, body::empty()),
                 ResponseDecision::Response { head, body } => (head, body.into_body_or_empty()),
@@ -861,7 +907,7 @@ async fn respond(
             Ok(d) => d,
             Err(e) => {
                 discard(pullable).await;
-                return Err(hook_error(e));
+                return Err(hook_error(&shared.guard, e));
             }
         };
     let original = async move |pullable: Option<PullableBody>, kept: Option<HookBody>| match (
@@ -950,6 +996,30 @@ pub(crate) fn wire_response(head: &ResponseHead, body: HookBody) -> Response {
         None
     };
     Response { status, reason, headers: to_wire_headers(&head.headers), body }
+}
+
+fn pipeline_failure(
+    shared: &Shared,
+    ctx: &ReqCtx,
+    err: PipelineError,
+    default_status: u16,
+) -> Response {
+    if let Some(guard) = &shared.guard {
+        use crate::EgressFailure;
+        let status = match &err {
+            PipelineError::Blocked(b) => b.status,
+            PipelineError::Plain { status, .. } => *status,
+            PipelineError::Other(_) => default_status,
+        };
+        guard.stop(match status {
+            403 => EgressFailure::Policy,
+            413 | 429 | 431 => EgressFailure::Limit,
+            502 | 504 => EgressFailure::Upstream,
+            _ => EgressFailure::Request,
+        });
+        return Response::new(status, vec![], body::empty());
+    }
+    error_response(ctx, err, default_status)
 }
 
 /// `respondWithError`: `<status> <text>[: <detail>]\n` as text/plain.

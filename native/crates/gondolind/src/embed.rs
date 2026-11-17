@@ -30,6 +30,8 @@ pub struct EmbeddedOptions {
     pub upstream_resolver: Option<Arc<dyn gondolin_egress::Resolver>>,
     /// Optional single-attachment frame budget with a direct terminal notification.
     pub frame_budget: Option<Arc<gondolin_netstack::budget::FrameBudget>>,
+    /// Optional terminal failure latch for HTTP(S)-only egress.
+    pub http_egress_guard: Option<Arc<gondolin_egress::HttpEgressGuard>>,
 }
 
 /// A running in-process session.

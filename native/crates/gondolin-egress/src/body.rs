@@ -44,6 +44,49 @@ pub fn with_guard<G: Send + Unpin + 'static>(body: HookBody, guard: G) -> HookBo
     HookBody::new(Guarded { body, _guard: guard })
 }
 
+/// Enforces a complete body ceiling even when no hook consumes the body.
+pub(crate) fn supervised_body(
+    body: HookBody,
+    max: u64,
+    guard: Arc<crate::HttpEgressGuard>,
+    cause: crate::EgressFailure,
+) -> HookBody {
+    struct Supervised {
+        body: LimitedBody<HookBody>,
+        guard: Arc<crate::HttpEgressGuard>,
+        cause: crate::EgressFailure,
+    }
+    impl Body for Supervised {
+        fn poll_data(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Data {
+            let result = Pin::new(&mut self.body).poll_data(cx);
+            if let Poll::Ready(Some(Err(e))) = &result {
+                let cause = if find_blocked(e.as_ref()).is_some() {
+                    crate::EgressFailure::Limit
+                } else {
+                    self.cause
+                };
+                self.guard.stop(cause);
+            }
+            result
+        }
+        fn is_end_stream(&self) -> bool {
+            self.body.is_end_stream()
+        }
+        fn size_hint(&self) -> SizeHint {
+            self.body.size_hint()
+        }
+    }
+    HookBody::new(Supervised {
+        body: LimitedBody::new(
+            body,
+            max,
+            Blocked::new(413, "Payload Too Large", "body size limit"),
+        ),
+        guard,
+        cause,
+    })
+}
+
 /// Error raised by [`LimitedBody`] when the limit is exceeded.
 #[derive(Debug)]
 pub struct BodyLimitExceeded(pub Blocked);

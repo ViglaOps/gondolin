@@ -108,12 +108,13 @@ impl std::error::Error for ConnectBlocked {}
 /// connects to the first reachable allowed address.
 #[derive(Clone)]
 pub struct GuardedConnector {
+    guard: Option<Arc<crate::HttpEgressGuard>>,
     policy: Arc<PolicyEngine>,
 }
 
 impl GuardedConnector {
-    pub fn new(policy: Arc<PolicyEngine>) -> Self {
-        Self { policy }
+    fn new(policy: Arc<PolicyEngine>, guard: Option<Arc<crate::HttpEgressGuard>>) -> Self {
+        Self { policy, guard }
     }
 }
 
@@ -136,7 +137,11 @@ impl Connect for GuardedConnector {
                 )))) as BoxError);
             }
             let stream = connect_any(&allowed, target.port).await?;
-            Ok(Box::new(stream) as gondolin_http::BoxIo)
+            if let Some(guard) = &self.guard {
+                Ok(Box::new(guard.protect(stream)) as gondolin_http::BoxIo)
+            } else {
+                Ok(Box::new(stream) as gondolin_http::BoxIo)
+            }
         })
     }
 }
@@ -162,9 +167,13 @@ async fn connect_any(addrs: &[IpAddr], port: u16) -> std::io::Result<TcpStream> 
 }
 
 /// Builds the pooled upstream client (`tls` with ALPN `http/1.1`).
-pub fn build_client(policy: Arc<PolicyEngine>, tls: Arc<ClientConfig>) -> UpstreamClient {
+pub fn build_client(
+    policy: Arc<PolicyEngine>,
+    tls: Arc<ClientConfig>,
+    guard: Option<Arc<crate::HttpEgressGuard>>,
+) -> UpstreamClient {
     Client::new(
-        Arc::new(GuardedConnector::new(policy)),
+        Arc::new(GuardedConnector::new(policy, guard)),
         Some(tls),
         HttpClientConfig {
             limits: HeadLimits {
